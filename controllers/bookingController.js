@@ -1,4 +1,9 @@
 const Booking = require("../models/Booking");
+const {
+    sendBookingPendingEmail,
+    sendBookingConfirmedEmail,
+    sendBookingCancelledEmail,
+} = require("../services/emailService");
 
 
 // ================= GET ALL BOOKINGS =================
@@ -156,6 +161,17 @@ const createBooking = async (req, res) => {
             });
 
 
+        // ================= SEND PENDING EMAIL =================
+        try {
+            await sendBookingPendingEmail(booking);
+        } catch (emailError) {
+            console.error(
+                "Booking created, but pending email notification failed:",
+                emailError.message
+            );
+        }
+
+
         // ================= RESPONSE =================
 
         res.status(201).json({
@@ -188,7 +204,7 @@ const updateBookingStatus = async (
 ) => {
     try {
         const { id } = req.params;
-        const { status } = req.body;
+        const { status, reason, cancellationReason } = req.body;
 
 
         // ================= VALIDATE STATUS =================
@@ -200,9 +216,11 @@ const updateBookingStatus = async (
             "Cancelled",
         ];
 
-        if (
-            !allowedStatuses.includes(status)
-        ) {
+        const matchedStatus = allowedStatuses.find(
+            (s) => s.toLowerCase() === (status || "").toLowerCase()
+        );
+
+        if (!matchedStatus) {
             return res.status(400).json({
                 success: false,
                 message:
@@ -211,26 +229,42 @@ const updateBookingStatus = async (
         }
 
 
-        // ================= UPDATE =================
+        // ================= FIND BOOKING =================
 
-        const booking =
-            await Booking.findByIdAndUpdate(
-                id,
-                {
-                    status,
-                },
-                {
-                    new: true,
-                    runValidators: true,
-                }
-            );
-
+        const booking = await Booking.findById(id);
 
         if (!booking) {
             return res.status(404).json({
                 success: false,
                 message: "Booking not found",
             });
+        }
+
+        const oldStatus = booking.status;
+        const newStatus = matchedStatus;
+
+        booking.status = newStatus;
+        await booking.save();
+
+
+        // ================= SEND STATUS EMAIL (ONLY IF STATUS CHANGED) =================
+        // Prevents duplicate emails when opening or re-saving the same status
+        if (oldStatus.toLowerCase() !== newStatus.toLowerCase()) {
+            try {
+                if (newStatus.toLowerCase() === "confirmed") {
+                    await sendBookingConfirmedEmail(booking);
+                } else if (newStatus.toLowerCase() === "cancelled") {
+                    await sendBookingCancelledEmail(
+                        booking,
+                        cancellationReason || reason || ""
+                    );
+                }
+            } catch (emailError) {
+                console.error(
+                    "Booking status updated, but email notification failed:",
+                    emailError.message
+                );
+            }
         }
 
 

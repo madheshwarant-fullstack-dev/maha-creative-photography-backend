@@ -1,7 +1,17 @@
 const Package = require("../models/Package");
+const mongoose = require("mongoose");
 const sharp = require("sharp");
 const fs = require("fs");
 const path = require("path");
+
+const buildPackageQuery = (idOrSlug) => {
+    if (!idOrSlug) return { _id: null };
+    const queries = [{ packageId: idOrSlug }];
+    if (mongoose.Types.ObjectId.isValid(idOrSlug)) {
+        queries.push({ _id: idOrSlug });
+    }
+    return { $or: queries };
+};
 
 // ================= IMAGE OPTIMIZATION =================
 
@@ -123,9 +133,9 @@ const getPackageById = async (req, res) => {
         const { packageId } = req.params;
 
         const packageData =
-            await Package.findOne({
-                packageId,
-            });
+            await Package.findOne(
+                buildPackageQuery(packageId)
+            );
 
         if (!packageData) {
             return res.status(404).json({
@@ -283,9 +293,9 @@ const updatePackage = async (req, res) => {
         // ================= FIND PACKAGE =================
 
         const packageData =
-            await Package.findOne({
-                packageId,
-            });
+            await Package.findOne(
+                buildPackageQuery(packageId)
+            );
 
         if (!packageData) {
             // Remove uploaded file if package
@@ -476,9 +486,9 @@ const deletePackage = async (req, res) => {
         const { packageId } = req.params;
 
         const deletedPackage =
-            await Package.findOneAndDelete({
-                packageId,
-            });
+            await Package.findOneAndDelete(
+                buildPackageQuery(packageId)
+            );
 
         if (!deletedPackage) {
             return res.status(404).json({

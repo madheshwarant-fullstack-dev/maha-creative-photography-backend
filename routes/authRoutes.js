@@ -6,6 +6,12 @@ const {
     getUsers,
     deleteUser,
     getProfile,
+    forgotPassword,
+    verifyResetToken,
+    resetPassword,
+    adminForgotPassword,
+    verifyAdminResetToken,
+    adminResetPassword,
 } = require("../controllers/authController");
 
 const {
@@ -16,7 +22,7 @@ const {
 const router = express.Router();
 
 
-// ================= PUBLIC ROUTES =================
+// ================= PUBLIC AUTH ROUTES =================
 
 // Client Register
 router.post(
@@ -28,6 +34,42 @@ router.post(
 router.post(
     "/login",
     loginUser
+);
+
+// Client Forgot Password
+router.post(
+    "/forgot-password",
+    forgotPassword
+);
+
+// Client Verify Reset Token
+router.get(
+    "/verify-reset-token/:token",
+    verifyResetToken
+);
+
+// Client Reset Password
+router.post(
+    "/reset-password/:token",
+    resetPassword
+);
+
+// Admin Forgot Password
+router.post(
+    "/admin/forgot-password",
+    adminForgotPassword
+);
+
+// Admin Verify Reset Token
+router.get(
+    "/admin/verify-reset-token/:token",
+    verifyAdminResetToken
+);
+
+// Admin Reset Password
+router.post(
+    "/admin/reset-password/:token",
+    adminResetPassword
 );
 
 
