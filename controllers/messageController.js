@@ -1,4 +1,8 @@
 const Message = require("../models/Message");
+const {
+    sendContactNotification,
+    sendContactAcknowledgement,
+} = require("../services/emailService");
 
 // ================= GET ALL MESSAGES =================
 
@@ -71,19 +75,73 @@ const createMessage = async (req, res) => {
             });
         }
 
+        const trimmedEmail = email.toLowerCase().trim();
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        if (!emailRegex.test(trimmedEmail)) {
+            return res.status(400).json({
+                success: false,
+                message: "Please provide a valid email address",
+            });
+        }
+
         const newMessage = await Message.create({
-            name,
-            email,
-            phone: phone || "",
-            subject: subject || "",
-            message,
+            name: name.trim(),
+            email: trimmedEmail,
+            phone: phone ? phone.trim() : "",
+            subject: subject ? subject.trim() : "",
+            message: message.trim(),
             status: "New",
         });
+
+        // ================= SEND EMAIL NOTIFICATIONS =================
+        let adminNotifResult = { success: false };
+        let clientAckResult = { success: false };
+
+        try {
+            // 1. Notify studio admin
+            adminNotifResult = await sendContactNotification({
+                name: newMessage.name,
+                email: newMessage.email,
+                phone: newMessage.phone,
+                subject: newMessage.subject,
+                message: newMessage.message,
+            });
+            if (!adminNotifResult.success) {
+                console.warn(
+                    "[Contact Inquiries] Admin email notification could not be sent:",
+                    adminNotifResult.error || "Unknown error"
+                );
+            }
+        } catch (adminErr) {
+            console.error("[Contact Inquiries] Exception notifying admin:", adminErr.message);
+        }
+
+        try {
+            // 2. Acknowledge customer
+            clientAckResult = await sendContactAcknowledgement({
+                name: newMessage.name,
+                email: newMessage.email,
+                subject: newMessage.subject,
+                message: newMessage.message,
+            });
+            if (!clientAckResult.success) {
+                console.warn(
+                    `[Contact Inquiries] Acknowledgement email to ${newMessage.email} could not be sent:`,
+                    clientAckResult.error || "Unknown error"
+                );
+            }
+        } catch (clientErr) {
+            console.error("[Contact Inquiries] Exception acknowledging client:", clientErr.message);
+        }
 
         res.status(201).json({
             success: true,
             message: "Message sent successfully",
             data: newMessage,
+            emailDelivery: {
+                adminNotified: !!adminNotifResult.success,
+                clientAcknowledged: !!clientAckResult.success,
+            },
         });
     } catch (error) {
         console.error("Create message error:", error);

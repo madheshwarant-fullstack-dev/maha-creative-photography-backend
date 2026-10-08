@@ -11,6 +11,9 @@ const packageRoutes = require("./routes/packageRoutes");
 const bookingRoutes = require("./routes/bookingRoutes");
 const messageRoutes = require("./routes/messageRoutes");
 
+const { logEmailConfiguration, verifyTransporter } = require("./services/emailService");
+const { isCloudinaryConfigured } = require("./config/cloudinary");
+
 const app = express();
 
 // Connect MongoDB
@@ -19,9 +22,11 @@ connectDB();
 // ================= PRODUCTION CORS CONFIGURATION =================
 const allowedOrigins = [
     "http://localhost:5173",
+    "http://localhost:5174",
     "http://localhost:3000",
     "http://localhost:5000",
     "http://127.0.0.1:5173",
+    "http://127.0.0.1:5174",
 ];
 
 // Append CLIENT_URL and FRONTEND_URL from environment variables if provided
@@ -73,7 +78,15 @@ if (!fs.existsSync(uploadsDir)) {
 }
 
 // Serve uploaded images with cross-origin resource sharing
-app.use("/uploads", express.static(uploadsDir));
+app.use(
+    "/uploads",
+    (req, res, next) => {
+        res.set("Access-Control-Allow-Origin", "*");
+        res.set("Cross-Origin-Resource-Policy", "cross-origin");
+        next();
+    },
+    express.static(uploadsDir)
+);
 
 // API Routes
 app.use("/api/auth", authRoutes);
@@ -100,6 +113,24 @@ app.get("/api/health", (req, res) => {
     });
 });
 
+// Email / SMTP Health & Diagnostic Endpoint
+app.get("/api/health/email", async (req, res) => {
+    try {
+        const smtpStatus = await verifyTransporter();
+        res.status(smtpStatus.verified ? 200 : (smtpStatus.configured ? 502 : 503)).json({
+            success: smtpStatus.verified,
+            smtp: smtpStatus,
+            timestamp: new Date().toISOString(),
+        });
+    } catch (err) {
+        res.status(500).json({
+            success: false,
+            message: "Error verifying SMTP service",
+            error: err.message,
+        });
+    }
+});
+
 // Centralized 404 Handler
 app.use((req, res, next) => {
     res.status(404).json({
@@ -122,4 +153,33 @@ const PORT = process.env.PORT || 5000;
 
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
+    
+    // Log Cloudinary configuration status
+    if (isCloudinaryConfigured()) {
+        console.log(`[Cloudinary] Connected and configured for persistent image storage (Cloud: ${process.env.CLOUDINARY_CLOUD_NAME})`);
+    } else {
+        console.warn(`[Cloudinary Warning] CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, or CLOUDINARY_API_SECRET not set in .env. Uploads will fail until configured.`);
+    }
+
+    // Log safe email configuration
+    logEmailConfiguration();
+
+    // Check SMTP service status
+    verifyTransporter()
+        .then((smtpStatus) => {
+            if (smtpStatus.verified) {
+                console.log(`[SMTP Service] Connected and verified (${smtpStatus.provider})`);
+            } else if (smtpStatus.configured) {
+                console.warn(`[SMTP Service Warning] Credentials configured but verification failed: ${smtpStatus.error}`);
+                if (smtpStatus.diagnosis) {
+                    console.warn(`[SMTP Service Recommendation] ${smtpStatus.diagnosis}`);
+                }
+            } else {
+                console.log(`[SMTP Service Info] ${smtpStatus.message}`);
+                console.log(`[SMTP Service Info] Add EMAIL_USER and EMAIL_PASSWORD in .env for active email sending.`);
+            }
+        })
+        .catch((err) => {
+            console.error(`[SMTP Service Error]:`, err.message);
+        });
 });

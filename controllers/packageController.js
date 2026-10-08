@@ -1,9 +1,13 @@
 const Package = require("../models/Package");
 const mongoose = require("mongoose");
-const sharp = require("sharp");
 const fs = require("fs");
 const path = require("path");
+const {
+    uploadToCloudinary,
+    deleteFromCloudinary,
+} = require("../config/cloudinary");
 
+// Query helper: find by packageId slug or MongoDB _id
 const buildPackageQuery = (idOrSlug) => {
     if (!idOrSlug) return { _id: null };
     const queries = [{ packageId: idOrSlug }];
@@ -13,129 +17,65 @@ const buildPackageQuery = (idOrSlug) => {
     return { $or: queries };
 };
 
-// ================= IMAGE OPTIMIZATION =================
-
-const optimizeImage = async (file) => {
-    if (!file) {
-        return null;
-    }
-
-    const uploadsDir = path.join(
-        __dirname,
-        "..",
-        "uploads"
-    );
-
-    // Make sure uploads folder exists
-    if (!fs.existsSync(uploadsDir)) {
-        fs.mkdirSync(uploadsDir, {
-            recursive: true,
-        });
-    }
-
-    const optimizedFileName =
-        Date.now() +
-        "-" +
-        Math.round(Math.random() * 1e9) +
-        ".webp";
-
-    const optimizedPath = path.join(
-        uploadsDir,
-        optimizedFileName
-    );
-
-    // Resize + compress + convert to WebP
-    await sharp(file.path)
-        .resize({
-            width: 1200,
-            height: 1200,
-            fit: "inside",
-            withoutEnlargement: true,
-        })
-        .webp({
-            quality: 80,
-        })
-        .toFile(optimizedPath);
-
-    // Delete original uploaded file
-    if (fs.existsSync(file.path)) {
-        fs.unlinkSync(file.path);
-    }
-
-    return `/uploads/${optimizedFileName}`;
-};
-
-// ================= DELETE OLD IMAGE =================
-
-const deleteOldImage = (imagePath) => {
+// Helper to remove legacy local upload file from disk if present
+const safeDeleteLocalFile = (imagePath) => {
     try {
-        if (!imagePath) {
-            return;
-        }
+        if (!imagePath || typeof imagePath !== "string") return;
+        if (!imagePath.includes("/uploads/")) return;
 
-        // Only delete local uploaded images
-        if (!imagePath.startsWith("/uploads/")) {
-            return;
-        }
-
-        const fileName = path.basename(
-            imagePath
-        );
-
-        const fullPath = path.join(
-            __dirname,
-            "..",
-            "uploads",
-            fileName
-        );
-
+        const fileName = path.basename(imagePath);
+        const fullPath = path.join(__dirname, "..", "uploads", fileName);
         if (fs.existsSync(fullPath)) {
             fs.unlinkSync(fullPath);
         }
-    } catch (error) {
-        console.error(
-            "Delete old image error:",
-            error
-        );
+    } catch (err) {
+        console.warn("[Local File Cleanup] Error unlinking legacy package file:", err.message);
     }
 };
 
-// ================= GET ALL PACKAGES =================
+// Normalize package document to ensure imageUrl and image are consistent
+const normalizePackage = (pkgDoc) => {
+    const doc = pkgDoc.toObject ? pkgDoc.toObject() : { ...pkgDoc };
+    const resolvedUrl = doc.imageUrl || doc.image || "";
+    const highlights = Array.isArray(doc.highlights)
+        ? doc.highlights
+        : (Array.isArray(doc.features) ? doc.features : []);
 
+    return {
+        ...doc,
+        imageUrl: resolvedUrl,
+        image: resolvedUrl,
+        highlights,
+        features: highlights,
+    };
+};
+
+// ================= GET ALL PACKAGES =================
+// Public endpoint for clients to view photography packages
 const getPackages = async (req, res) => {
     try {
-        const packages = await Package.find()
-            .sort({
-                createdAt: -1,
-            });
+        const rawPackages = await Package.find().sort({ createdAt: -1 });
+        const packages = rawPackages.map(normalizePackage);
 
         res.status(200).json({
             success: true,
             packages,
         });
     } catch (error) {
-        console.error(
-            "Get packages error:",
-            error
-        );
-
+        console.error("[Package Error] Get packages failed:", error);
         res.status(500).json({
             success: false,
-            message: "Server error",
+            message: "Failed to fetch packages. " + error.message,
         });
     }
 };
 
 // ================= GET PACKAGE BY ID =================
-
+// Public endpoint for package detail view
 const getPackageById = async (req, res) => {
     try {
         const { packageId } = req.params;
-
-        const packageData =
-            await Package.findOne(
-                buildPackageQuery(packageId)
-            );
+        const packageData = await Package.findOne(buildPackageQuery(packageId));
 
         if (!packageData) {
             return res.status(404).json({
@@ -146,26 +86,20 @@ const getPackageById = async (req, res) => {
 
         res.status(200).json({
             success: true,
-            package: packageData,
+            package: normalizePackage(packageData),
         });
     } catch (error) {
-        console.error(
-            "Get package error:",
-            error
-        );
-
+        console.error("[Package Error] Get package by ID failed:", error);
         res.status(500).json({
             success: false,
-            message: "Server error",
+            message: "Server error retrieving package. " + error.message,
         });
     }
 };
 
 // ================= ADD PACKAGE =================
-
+// Admin-only: Creates package, optionally uploads image to Cloudinary
 const addPackage = async (req, res) => {
-    let optimizedImagePath = null;
-
     try {
         const {
             packageId,
@@ -175,157 +109,95 @@ const addPackage = async (req, res) => {
             price,
             description,
             highlights,
+            features,
         } = req.body;
 
-        // ================= VALIDATION =================
-
-        if (
-            !packageId ||
-            !name ||
-            !category ||
-            !delivery ||
-            price === undefined
-        ) {
+        // Validation
+        if (!packageId || !name || !category || !delivery || price === undefined || price === "") {
             return res.status(400).json({
                 success: false,
-                message:
-                    "Required package fields are missing",
+                message: "Required package fields are missing (packageId, name, category, delivery, price).",
             });
         }
 
-        // ================= CHECK EXISTING PACKAGE =================
-
-        const existingPackage =
-            await Package.findOne({
-                packageId,
-            });
-
+        // Check if packageId already exists
+        const existingPackage = await Package.findOne({ packageId: packageId.trim() });
         if (existingPackage) {
             return res.status(400).json({
                 success: false,
-                message:
-                    "Package ID already exists",
+                message: `Package ID '${packageId}' already exists. Please choose a unique ID.`,
             });
         }
 
-        // ================= IMAGE =================
-
-        let image = "";
-
-        if (req.file) {
-            image =
-                await optimizeImage(
-                    req.file
-                );
-
-            optimizedImagePath = image;
-        }
-
-        // ================= HIGHLIGHTS =================
-
+        // Parse highlights / features
         let packageHighlights = [];
-
-        if (Array.isArray(highlights)) {
-            packageHighlights = highlights;
-        } else if (
-            typeof highlights === "string"
-        ) {
-            packageHighlights =
-                highlights
-                    .split(",")
-                    .map((item) =>
-                        item.trim()
-                    )
-                    .filter(Boolean);
+        const rawList = highlights || features;
+        if (Array.isArray(rawList)) {
+            packageHighlights = rawList;
+        } else if (typeof rawList === "string") {
+            // Support both comma-separated and newline-separated inputs
+            packageHighlights = rawList
+                .split(/[\r\n,]+/)
+                .map((item) => item.trim())
+                .filter(Boolean);
         }
 
-        // ================= CREATE PACKAGE =================
+        let imageUrl = "";
+        let publicId = "";
 
-        const newPackage =
-            await Package.create({
-                packageId,
-                name,
-                category,
-                delivery,
-                price: Number(price),
-                image,
-                description:
-                    description || "",
-                highlights:
-                    packageHighlights,
-            });
+        // If admin uploaded an image file
+        if (req.file) {
+            const uploadResult = await uploadToCloudinary(
+                req.file,
+                "maha-creative/packages"
+            );
+            imageUrl = uploadResult.secure_url;
+            publicId = uploadResult.public_id;
+        }
+
+        const newPackage = await Package.create({
+            packageId: packageId.trim(),
+            name: name.trim(),
+            category: category.trim(),
+            delivery: delivery.trim(),
+            price: Number(price),
+            imageUrl,
+            image: imageUrl,
+            publicId,
+            description: description ? description.trim() : "",
+            highlights: packageHighlights,
+            features: packageHighlights,
+        });
 
         res.status(201).json({
             success: true,
-            message:
-                "Package added successfully",
-            package: newPackage,
+            message: "Package added successfully",
+            package: normalizePackage(newPackage),
         });
     } catch (error) {
-        console.error(
-            "Add package error:",
-            error
-        );
-
-        // If DB creation fails after image
-        // optimization, remove optimized image
-        if (optimizedImagePath) {
-            deleteOldImage(
-                optimizedImagePath
-            );
-        }
-
+        console.error("[Package Error] Add package failed:", error);
         res.status(500).json({
             success: false,
-            message: "Server error",
+            message: error.message || "Failed to add package",
         });
     }
 };
 
 // ================= UPDATE PACKAGE =================
-
+// Admin-only: Updates package details. If a new image is provided,
+// uploads new image first, updates MongoDB, then removes old Cloudinary asset.
 const updatePackage = async (req, res) => {
-    let newImagePath = null;
-
     try {
         const { packageId } = req.params;
 
-        // ================= FIND PACKAGE =================
-
-        const packageData =
-            await Package.findOne(
-                buildPackageQuery(packageId)
-            );
+        const packageData = await Package.findOne(buildPackageQuery(packageId));
 
         if (!packageData) {
-            // Remove uploaded file if package
-            // doesn't exist
-            if (req.file) {
-                try {
-                    if (
-                        fs.existsSync(
-                            req.file.path
-                        )
-                    ) {
-                        fs.unlinkSync(
-                            req.file.path
-                        );
-                    }
-                } catch (fileError) {
-                    console.error(
-                        "Uploaded file cleanup error:",
-                        fileError
-                    );
-                }
-            }
-
             return res.status(404).json({
                 success: false,
                 message: "Package not found",
             });
         }
-
-        // ================= GET DATA =================
 
         const {
             name,
@@ -334,196 +206,119 @@ const updatePackage = async (req, res) => {
             price,
             description,
             highlights,
+            features,
         } = req.body;
 
-        // ================= UPDATE BASIC FIELDS =================
+        // Update fields if provided
+        if (name !== undefined) packageData.name = name.trim();
+        if (category !== undefined) packageData.category = category.trim();
+        if (delivery !== undefined) packageData.delivery = delivery.trim();
+        if (price !== undefined && price !== "") packageData.price = Number(price);
+        if (description !== undefined) packageData.description = description.trim();
 
-        if (name !== undefined) {
-            packageData.name = name;
-        }
-
-        if (category !== undefined) {
-            packageData.category =
-                category;
-        }
-
-        if (delivery !== undefined) {
-            packageData.delivery =
-                delivery;
-        }
-
-        if (price !== undefined) {
-            packageData.price =
-                Number(price);
-        }
-
-        if (description !== undefined) {
-            packageData.description =
-                description;
-        }
-
-        // ================= UPDATE HIGHLIGHTS =================
-
-        if (highlights !== undefined) {
-            if (
-                Array.isArray(
-                    highlights
-                )
-            ) {
-                packageData.highlights =
-                    highlights;
-            } else if (
-                typeof highlights ===
-                "string"
-            ) {
-                packageData.highlights =
-                    highlights
-                        .split(",")
-                        .map((item) =>
-                            item.trim()
-                        )
-                        .filter(Boolean);
+        // Update highlights / features
+        const rawList = highlights !== undefined ? highlights : features;
+        if (rawList !== undefined) {
+            if (Array.isArray(rawList)) {
+                packageData.highlights = rawList;
+                packageData.features = rawList;
+            } else if (typeof rawList === "string") {
+                const parsed = rawList
+                    .split(/[\r\n,]+/)
+                    .map((item) => item.trim())
+                    .filter(Boolean);
+                packageData.highlights = parsed;
+                packageData.features = parsed;
             }
         }
 
-        // ================= UPDATE IMAGE =================
-
+        // If admin selected a NEW image to replace the old one
         if (req.file) {
-            const oldImage =
-                packageData.image;
+            const oldPublicId = packageData.publicId;
+            const oldLocalImage = packageData.image;
 
-            // Optimize new image
-            newImagePath =
-                await optimizeImage(
-                    req.file
-                );
+            // 1. Upload new image to Cloudinary first
+            const uploadResult = await uploadToCloudinary(
+                req.file,
+                "maha-creative/packages"
+            );
 
-            // Set new image
-            packageData.image =
-                newImagePath;
+            // 2. Set new image values on document
+            packageData.imageUrl = uploadResult.secure_url;
+            packageData.image = uploadResult.secure_url;
+            packageData.publicId = uploadResult.public_id;
 
-            // Save package first
-            const updatedPackage =
-                await packageData.save();
+            // 3. Save to database FIRST
+            const updatedPackage = await packageData.save();
 
-            // Delete old image after successful save
-            if (
-                oldImage &&
-                oldImage !== newImagePath
-            ) {
-                deleteOldImage(
-                    oldImage
-                );
+            // 4. Delete old image ONLY after successful database update
+            if (oldPublicId) {
+                await deleteFromCloudinary(oldPublicId);
+            } else if (oldLocalImage) {
+                safeDeleteLocalFile(oldLocalImage);
             }
 
-            res.status(200).json({
+            return res.status(200).json({
                 success: true,
-                message:
-                    "Package updated successfully",
-                package:
-                    updatedPackage,
+                message: "Package and image updated successfully",
+                package: normalizePackage(updatedPackage),
             });
-
-            return;
         }
 
-        // ================= SAVE WITHOUT IMAGE =================
-
-        const updatedPackage =
-            await packageData.save();
+        // Admin did NOT select a new image -> KEEP EXISTING IMAGE UNCHANGED
+        const updatedPackage = await packageData.save();
 
         res.status(200).json({
             success: true,
-            message:
-                "Package updated successfully",
-            package: updatedPackage,
+            message: "Package updated successfully",
+            package: normalizePackage(updatedPackage),
         });
     } catch (error) {
-        console.error(
-            "Update package error:",
-            error
-        );
-
-        // Cleanup newly optimized image
-        // if update fails
-        if (newImagePath) {
-            deleteOldImage(
-                newImagePath
-            );
-        }
-
-        // Cleanup original multer file
-        if (req.file) {
-            try {
-                if (
-                    fs.existsSync(
-                        req.file.path
-                    )
-                ) {
-                    fs.unlinkSync(
-                        req.file.path
-                    );
-                }
-            } catch (fileError) {
-                console.error(
-                    "File cleanup error:",
-                    fileError
-                );
-            }
-        }
-
+        console.error("[Package Error] Update package failed:", error);
         res.status(500).json({
             success: false,
-            message: "Server error",
+            message: error.message || "Failed to update package",
         });
     }
 };
 
 // ================= DELETE PACKAGE =================
-
+// Admin-only: Deletes image from Cloudinary, then removes record from MongoDB
 const deletePackage = async (req, res) => {
     try {
         const { packageId } = req.params;
 
-        const deletedPackage =
-            await Package.findOneAndDelete(
-                buildPackageQuery(packageId)
-            );
+        const packageData = await Package.findOne(buildPackageQuery(packageId));
 
-        if (!deletedPackage) {
+        if (!packageData) {
             return res.status(404).json({
                 success: false,
-                message:
-                    "Package not found",
+                message: "Package not found",
             });
         }
 
-        // Delete package image from uploads
-        if (deletedPackage.image) {
-            deleteOldImage(
-                deletedPackage.image
-            );
+        // 1. Delete image from Cloudinary if publicId exists
+        if (packageData.publicId) {
+            await deleteFromCloudinary(packageData.publicId);
+        } else if (packageData.image) {
+            safeDeleteLocalFile(packageData.image);
         }
+
+        // 2. Delete database document
+        await Package.findOneAndDelete(buildPackageQuery(packageId));
 
         res.status(200).json({
             success: true,
-            message:
-                "Package deleted successfully",
+            message: "Package deleted successfully",
         });
     } catch (error) {
-        console.error(
-            "Delete package error:",
-            error
-        );
-
+        console.error("[Package Error] Delete package failed:", error);
         res.status(500).json({
             success: false,
-            message: "Server error",
+            message: error.message || "Failed to delete package",
         });
     }
 };
-
-// ================= EXPORT =================
 
 module.exports = {
     getPackages,

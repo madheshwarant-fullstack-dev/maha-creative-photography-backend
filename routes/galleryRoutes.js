@@ -1,5 +1,5 @@
 const express = require("express");
-const multer = require("multer");
+const upload = require("../middleware/upload");
 
 const {
     getGallery,
@@ -15,39 +15,12 @@ const {
 
 const router = express.Router();
 
+// ================= PUBLIC ROUTES =================
+// Anyone can view the photography gallery
+router.get("/", getGallery);
 
-// ================= MULTER STORAGE =================
-
-const storage = multer.diskStorage({
-    destination: (req, file, cb) => {
-        cb(null, "uploads/");
-    },
-
-    filename: (req, file, cb) => {
-        const uniqueName =
-            Date.now() + "-" + file.originalname;
-
-        cb(null, uniqueName);
-    },
-});
-
-const upload = multer({
-    storage,
-});
-
-
-// ================= PUBLIC =================
-
-// Client can view gallery
-router.get(
-    "/",
-    getGallery
-);
-
-
-// ================= ADMIN =================
-
-// Add gallery image
+// ================= ADMIN-ONLY ROUTES =================
+// Add gallery image: Cloudinary upload -> MongoDB persistence
 router.post(
     "/",
     protect,
@@ -56,8 +29,7 @@ router.post(
     addGallery
 );
 
-
-// Update gallery image
+// Update gallery image / details: Non-destructive, handles replacement safely
 router.put(
     "/:id",
     protect,
@@ -66,14 +38,12 @@ router.put(
     updateGallery
 );
 
-
-// Delete gallery image
+// Delete gallery image: Removes Cloudinary asset & MongoDB document
 router.delete(
     "/:id",
     protect,
     adminOnly,
     deleteGallery
 );
-
 
 module.exports = router;

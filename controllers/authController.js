@@ -2,7 +2,10 @@ const User = require("../models/User");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const crypto = require("crypto");
-const { sendPasswordResetEmail } = require("../services/emailService");
+const {
+    sendPasswordResetEmail,
+    sendWelcomeEmail,
+} = require("../services/emailService");
 
 // ================= REGISTER =================
 
@@ -27,8 +30,10 @@ const registerUser = async (req, res) => {
             });
         }
 
+        const normalizedEmail = email.toLowerCase().trim();
+
         const existingUser =
-            await User.findOne({ email });
+            await User.findOne({ email: normalizedEmail });
 
         if (existingUser) {
             return res.status(400).json({
@@ -41,12 +46,24 @@ const registerUser = async (req, res) => {
             await bcrypt.hash(password, 10);
 
         const user = await User.create({
-            name,
-            email,
-            phone,
+            name: name.trim(),
+            email: normalizedEmail,
+            phone: phone.trim(),
             password: hashedPassword,
             role: "user",
         });
+
+        // Send welcome email to the newly registered client
+        try {
+            sendWelcomeEmail({
+                to: user.email,
+                userName: user.name,
+            }).catch((err) => {
+                console.warn("[Register Warning] Failed to dispatch welcome email:", err.message);
+            });
+        } catch (emailErr) {
+            console.warn("[Register Warning] Welcome email error:", emailErr.message);
+        }
 
         res.status(201).json({
             success: true,
@@ -359,13 +376,17 @@ const forgotPassword = async (req, res) => {
 
         const user = await User.findOne({ email: normalizedEmail });
 
-        // Security best practice: If account doesn't exist or is admin, return safe response
-        // Client reset flow MUST NOT reset admin passwords
-        if (!user || user.role === "admin") {
-            return res.status(200).json({
-                success: true,
-                message:
-                    "If an account with that email exists, a password reset link has been sent to your email.",
+        if (!user) {
+            return res.status(404).json({
+                success: false,
+                message: "No registered account found with this email address. Please check your email or sign up.",
+            });
+        }
+
+        if (user.role === "admin") {
+            return res.status(400).json({
+                success: false,
+                message: "This email is registered as an administrator. Please use the Admin Password Recovery portal.",
             });
         }
 
@@ -389,17 +410,35 @@ const forgotPassword = async (req, res) => {
 
         const resetUrl = `${frontendBase}/reset-password/${resetToken}`;
 
-        await sendPasswordResetEmail({
+        console.log(`[FORGOT PASSWORD] Dispatching reset email to registered user: ${user.email}`);
+
+        const emailResult = await sendPasswordResetEmail({
             to: user.email,
             resetUrl,
             role: "user",
             userName: user.name,
         });
 
+        if (!emailResult.success) {
+            console.warn(`[Forgot Password Warning] Failed to deliver reset email to ${user.email}:`, emailResult.error || "Unknown error");
+            if (emailResult.configured === false) {
+                return res.status(503).json({
+                    success: false,
+                    message: "Email service is temporarily unavailable (SMTP credentials not configured on server).",
+                    error: "SMTP credentials not configured",
+                });
+            }
+            return res.status(502).json({
+                success: false,
+                message: "Unable to send password reset email at this moment. Please try again later.",
+                error: emailResult.error || "SMTP delivery failure",
+            });
+        }
+
         res.status(200).json({
             success: true,
-            message:
-                "If an account with that email exists, a password reset link has been sent to your email.",
+            message: `A password reset link has been sent to your registered email (${user.email}). Please check your inbox and spam folder.`,
+            recipient: user.email,
         });
     } catch (error) {
         console.error("Client forgot password error:", error);
@@ -547,12 +586,10 @@ const adminForgotPassword = async (req, res) => {
             role: "admin",
         });
 
-        // Security best practice: Safe response even if admin not found
         if (!admin) {
-            return res.status(200).json({
-                success: true,
-                message:
-                    "If an admin account with that email exists, a password reset link has been sent to your email.",
+            return res.status(404).json({
+                success: false,
+                message: "No registered administrator account found with that email address.",
             });
         }
 
@@ -575,17 +612,35 @@ const adminForgotPassword = async (req, res) => {
 
         const resetUrl = `${frontendBase}/admin/reset-password/${resetToken}`;
 
-        await sendPasswordResetEmail({
+        console.log(`[ADMIN FORGOT PASSWORD] Dispatching reset email to admin: ${admin.email}`);
+
+        const emailResult = await sendPasswordResetEmail({
             to: admin.email,
             resetUrl,
             role: "admin",
             userName: admin.name,
         });
 
+        if (!emailResult.success) {
+            console.warn(`[Admin Forgot Password Warning] Failed to deliver reset email to ${admin.email}:`, emailResult.error || "Unknown error");
+            if (emailResult.configured === false) {
+                return res.status(503).json({
+                    success: false,
+                    message: "Email service is temporarily unavailable (SMTP credentials not configured on server).",
+                    error: "SMTP credentials not configured",
+                });
+            }
+            return res.status(502).json({
+                success: false,
+                message: "Unable to send admin password reset email at this moment. Please check server SMTP configuration.",
+                error: emailResult.error || "SMTP delivery failure",
+            });
+        }
+
         res.status(200).json({
             success: true,
-            message:
-                "If an admin account with that email exists, a password reset link has been sent to your email.",
+            message: `An admin password reset link has been dispatched to ${admin.email}. Please check your inbox and spam folder.`,
+            recipient: admin.email,
         });
     } catch (error) {
         console.error("Admin forgot password error:", error);

@@ -3,6 +3,7 @@ const {
     sendBookingPendingEmail,
     sendBookingConfirmedEmail,
     sendBookingCancelledEmail,
+    sendAdminBookingNotification,
 } = require("../services/emailService");
 
 
@@ -161,24 +162,59 @@ const createBooking = async (req, res) => {
             });
 
 
-        // ================= SEND PENDING EMAIL =================
+        // ================= SEND NOTIFICATION EMAILS =================
+        let clientEmailResult = { success: false };
+        let adminEmailResult = { success: false };
+
         try {
-            await sendBookingPendingEmail(booking);
+            // 1. Send pending confirmation to client
+            clientEmailResult = await sendBookingPendingEmail(booking);
+            if (!clientEmailResult.success) {
+                console.warn(
+                    `[Booking Notice] Client confirmation email could not be sent to ${booking.email}:`,
+                    clientEmailResult.error || "Unknown error"
+                );
+            }
         } catch (emailError) {
             console.error(
-                "Booking created, but pending email notification failed:",
+                "[Booking Notice] Exception sending client email:",
                 emailError.message
             );
         }
 
+        try {
+            // 2. Send new booking notification to admin
+            adminEmailResult = await sendAdminBookingNotification({
+                booking,
+                type: "NEW_BOOKING",
+            });
+            if (!adminEmailResult.success) {
+                console.warn(
+                    "[Booking Notice] Admin booking notification email could not be sent:",
+                    adminEmailResult.error || "Unknown error"
+                );
+            }
+        } catch (adminEmailError) {
+            console.error(
+                "[Booking Notice] Exception sending admin notification email:",
+                adminEmailError.message
+            );
+        }
 
         // ================= RESPONSE =================
 
         res.status(201).json({
             success: true,
-            message:
-                "Booking created successfully",
+            message: "Booking submitted successfully! A confirmation email has been sent.",
             booking,
+            emailDelivery: {
+                clientSent: !!clientEmailResult.success,
+                adminSent: !!adminEmailResult.success,
+                recipient: booking.email,
+                ...(!clientEmailResult.success && clientEmailResult.error
+                    ? { clientNote: clientEmailResult.error }
+                    : {}),
+            },
         });
 
     } catch (error) {
@@ -242,21 +278,49 @@ const updateBookingStatus = async (
 
         const oldStatus = booking.status;
         const newStatus = matchedStatus;
+        const forceResend = req.body.forceResend === true || req.query.resend === "true";
 
         booking.status = newStatus;
         await booking.save();
 
 
-        // ================= SEND STATUS EMAIL (ONLY IF STATUS CHANGED) =================
-        // Prevents duplicate emails when opening or re-saving the same status
-        if (oldStatus.toLowerCase() !== newStatus.toLowerCase()) {
+        // ================= SEND STATUS EMAIL =================
+        let statusEmailResult = null;
+        let adminEmailResult = null;
+
+        // Trigger email if status changed, or if forceResend requested, or if confirmed
+        const shouldSend = forceResend || oldStatus.toLowerCase() !== newStatus.toLowerCase();
+
+        if (shouldSend) {
             try {
                 if (newStatus.toLowerCase() === "confirmed") {
-                    await sendBookingConfirmedEmail(booking);
+                    // 1. Send confirmation email to client
+                    statusEmailResult = await sendBookingConfirmedEmail(booking);
+                    // 2. Notify studio admin that booking is confirmed
+                    adminEmailResult = await sendAdminBookingNotification({
+                        booking,
+                        type: "BOOKING_CONFIRMED",
+                    });
                 } else if (newStatus.toLowerCase() === "cancelled") {
-                    await sendBookingCancelledEmail(
+                    // 1. Send cancellation email to client
+                    statusEmailResult = await sendBookingCancelledEmail(
                         booking,
                         cancellationReason || reason || ""
+                    );
+                    // 2. Notify studio admin that booking is cancelled
+                    adminEmailResult = await sendAdminBookingNotification({
+                        booking,
+                        type: "BOOKING_CANCELLED",
+                        cancellationReason: cancellationReason || reason || "",
+                    });
+                } else if (newStatus.toLowerCase() === "pending") {
+                    statusEmailResult = await sendBookingPendingEmail(booking);
+                }
+
+                if (statusEmailResult && !statusEmailResult.success) {
+                    console.warn(
+                        `[Booking Status Update] Email delivery to ${booking.email} failed:`,
+                        statusEmailResult.error || "Unknown error"
                     );
                 }
             } catch (emailError) {
@@ -270,9 +334,17 @@ const updateBookingStatus = async (
 
         res.status(200).json({
             success: true,
-            message:
-                "Booking status updated successfully",
+            message: `Booking status updated to ${newStatus} successfully`,
             booking,
+            emailDelivery: {
+                clientSent: !!(statusEmailResult && statusEmailResult.success),
+                adminSent: !!(adminEmailResult && adminEmailResult.success),
+                recipient: booking.email,
+                ...(statusEmailResult && !statusEmailResult.success
+                    ? { error: statusEmailResult.error }
+                    : {}),
+            },
+            emailSent: !!(statusEmailResult && statusEmailResult.success),
         });
 
     } catch (error) {
