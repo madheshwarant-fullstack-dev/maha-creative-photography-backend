@@ -129,7 +129,7 @@ if (!fs.existsSync(uploadsDir)) {
     fs.mkdirSync(uploadsDir, { recursive: true });
 }
 
-// Serve uploaded images with cross-origin resource sharing
+// Serve uploaded images with cross-origin resource sharing & database fallback
 app.use(
     "/uploads",
     (req, res, next) => {
@@ -137,7 +137,50 @@ app.use(
         res.set("Cross-Origin-Resource-Policy", "cross-origin");
         next();
     },
-    express.static(uploadsDir)
+    express.static(uploadsDir),
+    // Fallback: If image file is not found on ephemeral container disk, serve from database if present
+    async (req, res, next) => {
+        try {
+            const requestedFile = req.path.replace(/^\/+/, "");
+            if (!requestedFile) return next();
+
+            const Gallery = require("./models/Gallery");
+            const Package = require("./models/Package");
+
+            const escaped = requestedFile.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+            const fileRegex = new RegExp(escaped, "i");
+
+            const galleryMatch = await Gallery.findOne({
+                $or: [{ imageUrl: fileRegex }, { image: fileRegex }],
+            });
+
+            let candidate = galleryMatch ? (galleryMatch.imageUrl || galleryMatch.image) : null;
+
+            if (!candidate) {
+                const packageMatch = await Package.findOne({
+                    $or: [{ imageUrl: fileRegex }, { image: fileRegex }],
+                });
+                if (packageMatch) {
+                    candidate = packageMatch.imageUrl || packageMatch.image;
+                }
+            }
+
+            if (candidate && candidate.startsWith("data:")) {
+                const parts = candidate.match(/^data:([^;]+);base64,(.+)$/);
+                if (parts) {
+                    const contentType = parts[1];
+                    const imgBuffer = Buffer.from(parts[2], "base64");
+                    res.set("Content-Type", contentType);
+                    res.set("Cache-Control", "public, max-age=86400, immutable");
+                    return res.send(imgBuffer);
+                }
+            }
+
+            next();
+        } catch (err) {
+            next();
+        }
+    }
 );
 
 // API Routes

@@ -25,9 +25,33 @@ const safeDeleteLocalFile = (imagePath) => {
     }
 };
 
+const sharp = require("sharp");
+
+/**
+ * Optimizes an image buffer into a lightweight WebP image
+ * suitable for fast web delivery and database persistence.
+ *
+ * @param {Buffer} buffer - Raw image buffer
+ * @returns {Promise<Buffer>}
+ */
+const optimizeImageBuffer = async (buffer) => {
+    try {
+        return await sharp(buffer)
+            .resize(1600, 1600, {
+                fit: "inside",
+                withoutEnlargement: true,
+            })
+            .webp({ quality: 82, effort: 4 })
+            .toBuffer();
+    } catch (err) {
+        console.warn("[Storage Warning] Sharp WebP optimization failed, retaining original buffer:", err.message);
+        return buffer;
+    }
+};
+
 /**
  * Persists an uploaded image using Cloudinary (if configured)
- * or permanent local disk storage as a reliable fallback.
+ * or a permanent, web-optimized WebP Data URI with local disk backup.
  *
  * @param {Object} file - Multer file object
  * @param {string} folder - Destination folder for Cloudinary
@@ -36,6 +60,11 @@ const safeDeleteLocalFile = (imagePath) => {
 const saveUploadedImage = async (file, folder = "maha-creative/gallery") => {
     if (!file) {
         throw new Error("No file provided for upload.");
+    }
+
+    const rawBuffer = Buffer.isBuffer(file) ? file : file.buffer;
+    if (!rawBuffer) {
+        throw new Error("Invalid file upload: no buffer available to persist.");
     }
 
     // 1. If Cloudinary credentials are fully configured in .env, stream to Cloudinary
@@ -51,37 +80,41 @@ const saveUploadedImage = async (file, folder = "maha-creative/gallery") => {
             };
         } catch (cloudErr) {
             console.error(
-                `[Storage Error] Cloudinary upload failed: ${cloudErr.message}. Falling back to permanent local storage.`
+                `[Storage Error] Cloudinary upload failed: ${cloudErr.message}. Falling back to permanent database storage.`
             );
         }
     }
 
-    // 2. Hybrid Fallback: Save permanently to local uploads directory
-    if (!fs.existsSync(uploadsDir)) {
-        fs.mkdirSync(uploadsDir, { recursive: true });
+    // 2. Resilient Permanent Storage: Compress with Sharp to WebP & generate Data URI
+    // This guarantees images NEVER 404, survive ephemeral cloud host restarts,
+    // and sync flawlessly between local development and cloud production.
+    const optimizedBuffer = await optimizeImageBuffer(rawBuffer);
+    const dataUri = `data:image/webp;base64,${optimizedBuffer.toString("base64")}`;
+
+    // 3. Save local file backup to uploads directory for local cache
+    try {
+        if (!fs.existsSync(uploadsDir)) {
+            fs.mkdirSync(uploadsDir, { recursive: true });
+        }
+
+        const ext = path.extname(file.originalname || "").toLowerCase() || ".webp";
+        const baseName = path
+            .basename(file.originalname || "image", ext)
+            .replace(/[^a-zA-Z0-9_-]/g, "_");
+        const uniqueFileName = `${Date.now()}-${baseName}.webp`;
+        const destinationPath = path.join(uploadsDir, uniqueFileName);
+
+        fs.writeFileSync(destinationPath, optimizedBuffer);
+        console.log(`[Storage] Image optimized and cached locally: uploads/${uniqueFileName}`);
+    } catch (diskErr) {
+        console.warn("[Storage Warning] Disk caching failed (non-critical):", diskErr.message);
     }
 
-    const ext = path.extname(file.originalname || "").toLowerCase() || ".jpg";
-    const baseName = path
-        .basename(file.originalname || "image", ext)
-        .replace(/[^a-zA-Z0-9_-]/g, "_");
-    const uniqueFileName = `${Date.now()}-${baseName}${ext}`;
-    const destinationPath = path.join(uploadsDir, uniqueFileName);
-
-    const buffer = Buffer.isBuffer(file) ? file : file.buffer;
-    if (!buffer) {
-        throw new Error("Invalid file upload: no buffer available to persist.");
-    }
-
-    fs.writeFileSync(destinationPath, buffer);
-    console.log(`[Storage] Image successfully stored locally: uploads/${uniqueFileName}`);
-
-    const localUrl = `/uploads/${uniqueFileName}`;
     return {
-        imageUrl: localUrl,
-        image: localUrl,
+        imageUrl: dataUri,
+        image: dataUri,
         publicId: "",
-        storageType: "local",
+        storageType: "database_uri",
     };
 };
 
