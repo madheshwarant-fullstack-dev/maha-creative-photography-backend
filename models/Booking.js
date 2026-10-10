@@ -70,6 +70,7 @@ const bookingSchema = new mongoose.Schema(
         packagePrice: {
             type: Number,
             default: 0,
+            min: [0, "Package price must be a non-negative number"],
         },
 
         // ================= BOOKING STATUS =================

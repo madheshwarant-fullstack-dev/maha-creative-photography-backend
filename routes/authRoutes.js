@@ -6,6 +6,7 @@ const {
     getUsers,
     deleteUser,
     getProfile,
+    updateProfile,
     forgotPassword,
     verifyResetToken,
     resetPassword,
@@ -18,6 +19,7 @@ const {
     protect,
     adminOnly,
 } = require("../middleware/authMiddleware");
+const validateObjectId = require("../middleware/validateId");
 
 const router = express.Router();
 
@@ -82,6 +84,13 @@ router.get(
     getProfile
 );
 
+// Update logged-in user profile
+router.put(
+    "/profile",
+    protect,
+    updateProfile
+);
+
 // ================= ADMIN ROUTES =================
 
 // Get all registered users
@@ -97,6 +106,7 @@ router.delete(
     "/users/:id",
     protect,
     adminOnly,
+    validateObjectId("id"),
     deleteUser
 );
 

@@ -1,26 +1,8 @@
-const fs = require("fs");
-const path = require("path");
 const Gallery = require("../models/Gallery");
 const {
-    uploadToCloudinary,
-    deleteFromCloudinary,
-} = require("../config/cloudinary");
-
-// Helper to remove any legacy local uploads file from disk
-const safeDeleteLocalFile = (imagePath) => {
-    try {
-        if (!imagePath || typeof imagePath !== "string") return;
-        if (!imagePath.includes("/uploads/")) return;
-
-        const fileName = path.basename(imagePath);
-        const fullPath = path.join(__dirname, "..", "uploads", fileName);
-        if (fs.existsSync(fullPath)) {
-            fs.unlinkSync(fullPath);
-        }
-    } catch (err) {
-        console.warn("[Local File Cleanup] Error unlinking legacy file:", err.message);
-    }
-};
+    saveUploadedImage,
+    deleteStoredImage,
+} = require("../services/storageService");
 
 // ================= GET ALL GALLERY IMAGES =================
 // Public endpoint for viewing gallery
@@ -53,7 +35,7 @@ const getGallery = async (req, res) => {
 };
 
 // ================= ADD GALLERY IMAGE =================
-// Admin-only: Uploads to Cloudinary, stores permanent URL & publicId in MongoDB
+// Admin-only: Uploads image via hybrid storage, stores URL & publicId in MongoDB
 const addGallery = async (req, res) => {
     try {
         const { title, category, description } = req.body;
@@ -72,8 +54,8 @@ const addGallery = async (req, res) => {
             });
         }
 
-        // 1. Upload image to Cloudinary in permanent folder
-        const uploadResult = await uploadToCloudinary(
+        // 1. Upload image (Cloudinary when configured, local disk fallback)
+        const savedImage = await saveUploadedImage(
             req.file,
             "maha-creative/gallery"
         );
@@ -82,9 +64,9 @@ const addGallery = async (req, res) => {
         const newGallery = await Gallery.create({
             title: title.trim(),
             category: category.trim(),
-            imageUrl: uploadResult.secure_url,
-            image: uploadResult.secure_url,
-            publicId: uploadResult.public_id,
+            imageUrl: savedImage.imageUrl,
+            image: savedImage.image,
+            publicId: savedImage.publicId,
             description: description ? description.trim() : "",
         });
 
@@ -104,7 +86,7 @@ const addGallery = async (req, res) => {
 
 // ================= UPDATE GALLERY IMAGE =================
 // Admin-only: Updates metadata. If a new image is provided, uploads new image first,
-// updates DB, then safely removes the old Cloudinary asset.
+// updates DB, then safely removes the old asset.
 const updateGallery = async (req, res) => {
     try {
         const { id } = req.params;
@@ -133,28 +115,24 @@ const updateGallery = async (req, res) => {
         // If admin selected a NEW image to replace the old one
         if (req.file) {
             const oldPublicId = existingGallery.publicId;
-            const oldLocalImage = existingGallery.image;
+            const oldImage = existingGallery.image || existingGallery.imageUrl;
 
-            // 1. Upload new image to Cloudinary first
-            const uploadResult = await uploadToCloudinary(
+            // 1. Upload new image first
+            const savedImage = await saveUploadedImage(
                 req.file,
                 "maha-creative/gallery"
             );
 
             // 2. Update image attributes
-            existingGallery.imageUrl = uploadResult.secure_url;
-            existingGallery.image = uploadResult.secure_url;
-            existingGallery.publicId = uploadResult.public_id;
+            existingGallery.imageUrl = savedImage.imageUrl;
+            existingGallery.image = savedImage.image;
+            existingGallery.publicId = savedImage.publicId;
 
             // 3. Save to database FIRST
             const updatedGallery = await existingGallery.save();
 
             // 4. Delete old image ONLY after successful database save
-            if (oldPublicId) {
-                await deleteFromCloudinary(oldPublicId);
-            } else if (oldLocalImage) {
-                safeDeleteLocalFile(oldLocalImage);
-            }
+            await deleteStoredImage(oldPublicId, oldImage);
 
             return res.status(200).json({
                 success: true,
@@ -181,7 +159,7 @@ const updateGallery = async (req, res) => {
 };
 
 // ================= DELETE GALLERY IMAGE =================
-// Admin-only: Safely removes image from Cloudinary, then removes record from MongoDB
+// Admin-only: Safely removes image asset, then removes record from MongoDB
 const deleteGallery = async (req, res) => {
     try {
         const { id } = req.params;
@@ -195,13 +173,11 @@ const deleteGallery = async (req, res) => {
             });
         }
 
-        // 1. Delete asset from Cloudinary if publicId exists
-        if (existingGallery.publicId) {
-            await deleteFromCloudinary(existingGallery.publicId);
-        } else if (existingGallery.image) {
-            // Clean up legacy local file if present
-            safeDeleteLocalFile(existingGallery.image);
-        }
+        // 1. Delete asset from Cloudinary or local disk
+        await deleteStoredImage(
+            existingGallery.publicId,
+            existingGallery.image || existingGallery.imageUrl
+        );
 
         // 2. Delete database document
         await Gallery.findByIdAndDelete(id);

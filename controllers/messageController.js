@@ -173,7 +173,7 @@ const updateMessageStatus = async (req, res) => {
                 id,
                 { status },
                 {
-                    new: true,
+                    returnDocument: "after",
                     runValidators: true,
                 }
             );

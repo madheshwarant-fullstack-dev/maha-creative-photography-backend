@@ -1,11 +1,9 @@
 const Package = require("../models/Package");
 const mongoose = require("mongoose");
-const fs = require("fs");
-const path = require("path");
 const {
-    uploadToCloudinary,
-    deleteFromCloudinary,
-} = require("../config/cloudinary");
+    saveUploadedImage,
+    deleteStoredImage,
+} = require("../services/storageService");
 
 // Query helper: find by packageId slug or MongoDB _id
 const buildPackageQuery = (idOrSlug) => {
@@ -15,22 +13,6 @@ const buildPackageQuery = (idOrSlug) => {
         queries.push({ _id: idOrSlug });
     }
     return { $or: queries };
-};
-
-// Helper to remove legacy local upload file from disk if present
-const safeDeleteLocalFile = (imagePath) => {
-    try {
-        if (!imagePath || typeof imagePath !== "string") return;
-        if (!imagePath.includes("/uploads/")) return;
-
-        const fileName = path.basename(imagePath);
-        const fullPath = path.join(__dirname, "..", "uploads", fileName);
-        if (fs.existsSync(fullPath)) {
-            fs.unlinkSync(fullPath);
-        }
-    } catch (err) {
-        console.warn("[Local File Cleanup] Error unlinking legacy package file:", err.message);
-    }
 };
 
 // Normalize package document to ensure imageUrl and image are consistent
@@ -147,12 +129,12 @@ const addPackage = async (req, res) => {
 
         // If admin uploaded an image file
         if (req.file) {
-            const uploadResult = await uploadToCloudinary(
+            const savedImage = await saveUploadedImage(
                 req.file,
                 "maha-creative/packages"
             );
-            imageUrl = uploadResult.secure_url;
-            publicId = uploadResult.public_id;
+            imageUrl = savedImage.imageUrl;
+            publicId = savedImage.publicId;
         }
 
         const newPackage = await Package.create({
@@ -235,28 +217,24 @@ const updatePackage = async (req, res) => {
         // If admin selected a NEW image to replace the old one
         if (req.file) {
             const oldPublicId = packageData.publicId;
-            const oldLocalImage = packageData.image;
+            const oldImage = packageData.image || packageData.imageUrl;
 
-            // 1. Upload new image to Cloudinary first
-            const uploadResult = await uploadToCloudinary(
+            // 1. Upload new image first
+            const savedImage = await saveUploadedImage(
                 req.file,
                 "maha-creative/packages"
             );
 
             // 2. Set new image values on document
-            packageData.imageUrl = uploadResult.secure_url;
-            packageData.image = uploadResult.secure_url;
-            packageData.publicId = uploadResult.public_id;
+            packageData.imageUrl = savedImage.imageUrl;
+            packageData.image = savedImage.image;
+            packageData.publicId = savedImage.publicId;
 
             // 3. Save to database FIRST
             const updatedPackage = await packageData.save();
 
             // 4. Delete old image ONLY after successful database update
-            if (oldPublicId) {
-                await deleteFromCloudinary(oldPublicId);
-            } else if (oldLocalImage) {
-                safeDeleteLocalFile(oldLocalImage);
-            }
+            await deleteStoredImage(oldPublicId, oldImage);
 
             return res.status(200).json({
                 success: true,
@@ -297,12 +275,11 @@ const deletePackage = async (req, res) => {
             });
         }
 
-        // 1. Delete image from Cloudinary if publicId exists
-        if (packageData.publicId) {
-            await deleteFromCloudinary(packageData.publicId);
-        } else if (packageData.image) {
-            safeDeleteLocalFile(packageData.image);
-        }
+        // 1. Delete image asset if present
+        await deleteStoredImage(
+            packageData.publicId,
+            packageData.image || packageData.imageUrl
+        );
 
         // 2. Delete database document
         await Package.findOneAndDelete(buildPackageQuery(packageId));

@@ -2,9 +2,12 @@ const express = require("express");
 const cors = require("cors");
 const path = require("path");
 const fs = require("fs");
+const helmet = require("helmet");
+const rateLimit = require("express-rate-limit");
 require("dotenv").config();
 
 const connectDB = require("./config/db");
+const mongoSanitize = require("./middleware/sanitize");
 const authRoutes = require("./routes/authRoutes");
 const galleryRoutes = require("./routes/galleryRoutes");
 const packageRoutes = require("./routes/packageRoutes");
@@ -16,8 +19,18 @@ const { isCloudinaryConfigured } = require("./config/cloudinary");
 
 const app = express();
 
-// Connect MongoDB
-connectDB();
+// Connect MongoDB (if not running in isolated test mode)
+if (process.env.NODE_ENV !== "test") {
+    connectDB();
+}
+
+// ================= SECURITY HEADERS =================
+app.use(
+    helmet({
+        crossOriginResourcePolicy: { policy: "cross-origin" },
+        contentSecurityPolicy: false,
+    })
+);
 
 // ================= PRODUCTION CORS CONFIGURATION =================
 const allowedOrigins = [
@@ -47,17 +60,22 @@ const corsOptions = {
         // Normalize origin without trailing slash
         const normalizedOrigin = origin.replace(/\/+$/, "");
 
-        // Check if origin matches allowed list or any Vercel deployment preview / production domain
+        const isDev = !process.env.NODE_ENV || process.env.NODE_ENV === "development" || process.env.NODE_ENV === "test";
+        const isLocalhost = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(normalizedOrigin);
+        const isVercel = /https:\/\/maha-creative.*\.vercel\.app$/i.test(normalizedOrigin);
+
+        // Verify against allowed origins or legitimate project Vercel deployments or local dev
         const isAllowed =
-            allowedOrigins.includes(normalizedOrigin) ||
-            normalizedOrigin.endsWith(".vercel.app") ||
-            process.env.NODE_ENV !== "production";
+            isDev ||
+            isLocalhost ||
+            isVercel ||
+            allowedOrigins.includes(normalizedOrigin);
 
         if (isAllowed) {
             return callback(null, true);
         } else {
             console.warn(`[CORS Blocked] Origin not allowed: ${origin}`);
-            return callback(new Error(`CORS blocked for origin: ${origin}`));
+            return callback(null, false);
         }
     },
     credentials: true,
@@ -67,9 +85,43 @@ const corsOptions = {
 
 app.use(cors(corsOptions));
 
-// Middleware
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+// ================= RATE LIMITING =================
+const generalLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 300,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: {
+        success: false,
+        message: "Too many requests from this IP, please try again after 15 minutes.",
+    },
+});
+
+const authLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 30, // 30 attempts per 15 minutes
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: {
+        success: false,
+        message: "Too many authentication attempts, please try again after 15 minutes.",
+    },
+});
+
+if (process.env.NODE_ENV !== "test") {
+    app.use("/api", generalLimiter);
+    app.use("/api/auth/login", authLimiter);
+    app.use("/api/auth/register", authLimiter);
+    app.use("/api/auth/forgot-password", authLimiter);
+    app.use("/api/auth/admin/forgot-password", authLimiter);
+}
+
+// Body parsers with safe payload limits
+app.use(express.json({ limit: "5mb" }));
+app.use(express.urlencoded({ extended: true, limit: "5mb" }));
+
+// NoSQL query sanitizer
+app.use(mongoSanitize);
 
 // Ensure uploads folder exists on startup
 const uploadsDir = path.join(__dirname, "uploads");
@@ -148,38 +200,42 @@ app.use((err, req, res, next) => {
     });
 });
 
-// Server Listen
+// Server Listen (only when executed directly)
 const PORT = process.env.PORT || 5000;
 
-app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-    
-    // Log Cloudinary configuration status
-    if (isCloudinaryConfigured()) {
-        console.log(`[Cloudinary] Connected and configured for persistent image storage (Cloud: ${process.env.CLOUDINARY_CLOUD_NAME})`);
-    } else {
-        console.warn(`[Cloudinary Warning] CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, or CLOUDINARY_API_SECRET not set in .env. Uploads will fail until configured.`);
-    }
+if (process.env.NODE_ENV !== "test") {
+    app.listen(PORT, () => {
+        console.log(`Server running on port ${PORT}`);
+        
+        // Log Cloudinary configuration status
+        if (isCloudinaryConfigured()) {
+            console.log(`[Cloudinary] Connected and configured for persistent image storage (Cloud: ${process.env.CLOUDINARY_CLOUD_NAME})`);
+        } else {
+            console.warn(`[Cloudinary Warning] CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, or CLOUDINARY_API_SECRET not set in .env. Uploads will fall back to local disk.`);
+        }
 
-    // Log safe email configuration
-    logEmailConfiguration();
+        // Log safe email configuration
+        logEmailConfiguration();
 
-    // Check SMTP service status
-    verifyTransporter()
-        .then((smtpStatus) => {
-            if (smtpStatus.verified) {
-                console.log(`[SMTP Service] Connected and verified (${smtpStatus.provider})`);
-            } else if (smtpStatus.configured) {
-                console.warn(`[SMTP Service Warning] Credentials configured but verification failed: ${smtpStatus.error}`);
-                if (smtpStatus.diagnosis) {
-                    console.warn(`[SMTP Service Recommendation] ${smtpStatus.diagnosis}`);
+        // Check SMTP service status
+        verifyTransporter()
+            .then((smtpStatus) => {
+                if (smtpStatus.verified) {
+                    console.log(`[SMTP Service] Connected and verified (${smtpStatus.provider})`);
+                } else if (smtpStatus.configured) {
+                    console.warn(`[SMTP Service Warning] Credentials configured but verification failed: ${smtpStatus.error}`);
+                    if (smtpStatus.diagnosis) {
+                        console.warn(`[SMTP Service Recommendation] ${smtpStatus.diagnosis}`);
+                    }
+                } else {
+                    console.log(`[SMTP Service Info] ${smtpStatus.message}`);
+                    console.log(`[SMTP Service Info] Add EMAIL_USER and EMAIL_PASSWORD in .env for active email sending.`);
                 }
-            } else {
-                console.log(`[SMTP Service Info] ${smtpStatus.message}`);
-                console.log(`[SMTP Service Info] Add EMAIL_USER and EMAIL_PASSWORD in .env for active email sending.`);
-            }
-        })
-        .catch((err) => {
-            console.error(`[SMTP Service Error]:`, err.message);
-        });
-});
+            })
+            .catch((err) => {
+                console.error(`[SMTP Service Error]:`, err.message);
+            });
+    });
+}
+
+module.exports = app;

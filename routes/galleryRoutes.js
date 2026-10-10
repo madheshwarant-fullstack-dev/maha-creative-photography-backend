@@ -12,6 +12,7 @@ const {
     protect,
     adminOnly,
 } = require("../middleware/authMiddleware");
+const validateObjectId = require("../middleware/validateId");
 
 const router = express.Router();
 
@@ -34,6 +35,7 @@ router.put(
     "/:id",
     protect,
     adminOnly,
+    validateObjectId("id"),
     upload.single("image"),
     updateGallery
 );
@@ -43,6 +45,7 @@ router.delete(
     "/:id",
     protect,
     adminOnly,
+    validateObjectId("id"),
     deleteGallery
 );
 
